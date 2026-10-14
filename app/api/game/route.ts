@@ -1,14 +1,6 @@
 import { env } from "cloudflare:workers";
 import { NextRequest, NextResponse } from "next/server";
 
-const EVENTS = [
-  { key: "steady", name: "Steady market", brief: "Demand follows normal buying patterns.", effect: "No market-wide modifier." },
-  { key: "boom", name: "Software boom", brief: "Buyers are replacing manual workflows.", effect: "Demand rises and marketing converts better." },
-  { key: "privacy", name: "Privacy backlash", brief: "Customers scrutinize how software handles data.", effect: "Social investment and reputation matter more." },
-  { key: "recession", name: "Budget freeze", brief: "Customers cut discretionary software spending.", effect: "High prices face resistance; cash discipline matters." },
-  { key: "outage", name: "Infrastructure disruption", brief: "Reliability becomes the market's primary concern.", effect: "Operations investment protects retention." },
-  { key: "hype", name: "AI attention spike", brief: "New buyers flood the category with new competitors.", effect: "Demand rises, but weak products churn faster." },
-];
 const SPECIALIZATIONS = ["Sales", "Marketing", "Customer Support", "Operations"];
 const SEGMENTS = ["Solo professionals", "Local businesses", "Small online businesses", "Growing companies"];
 const RISKS: Record<string, { label: string; chance: number; up: number; down: number }> = {
@@ -54,7 +46,7 @@ async function publicState() {
     const winner = (field: string) => [...awardRows].sort((a,b)=>Number(b[field])-Number(a[field]))[0]?.name || "—";
     awards = { value: winner("valuation"), cash: winner("cash"), impact: winner("social_impact"), risk: winner("risk_score") };
   }
-  return { game, teams: (teams.results as any[]).map((team, i) => ({ ...team, rank: i + 1, marketShare: team.customers / total })), history:[...historyByTeam.values()], awards, announcement, events: EVENTS, specializations: SPECIALIZATIONS, segments: SEGMENTS, risks: Object.entries(RISKS).map(([key, value]) => ({ key, ...value })) };
+  return { game, teams: (teams.results as any[]).map((team, i) => ({ ...team, rank: i + 1, marketShare: team.customers / total })), history:[...historyByTeam.values()], awards, announcement, specializations: SPECIALIZATIONS, segments: SEGMENTS, risks: Object.entries(RISKS).map(([key, value]) => ({ key, ...value })) };
 }
 
 export async function GET(req: NextRequest) {
@@ -96,9 +88,8 @@ export async function POST(req: NextRequest) {
     if (body.action === "openQuarter") {
       const current = await db().prepare("SELECT quarter FROM game WHERE id=1").first<any>();
       const quarter = Math.min(4, Math.max(1, n(body.quarter, current?.quarter + 1)));
-      const eventKey = EVENTS.some((event) => event.key === body.eventKey) ? body.eventKey : "steady";
       const minutes = clamp(n(body.minutes, 12), 5, 20);
-      await db().batch([db().prepare("UPDATE game SET quarter=?,status='active',event_key=?,deadline_at=?,updated_at=? WHERE id=1").bind(quarter,eventKey,Date.now()+minutes*60000,Date.now()), db().prepare("UPDATE teams SET submitted=0 WHERE status='active'")]);
+      await db().batch([db().prepare("UPDATE game SET quarter=?,status='active',event_key='steady',deadline_at=?,updated_at=? WHERE id=1").bind(quarter,Date.now()+minutes*60000,Date.now()), db().prepare("UPDATE teams SET submitted=0 WHERE status='active'")]);
       return NextResponse.json({ ok: true });
     }
     if (body.action === "lock") { const current=await db().prepare("SELECT status FROM game WHERE id=1").first<any>(); const next=current?.status==="locked"?"active":"locked"; await db().prepare("UPDATE game SET status=?,updated_at=? WHERE id=1").bind(next,Date.now()).run(); return NextResponse.json({ ok: true,status:next }); }
@@ -175,18 +166,18 @@ async function resolveQuarter() {
   const updates: D1PreparedStatement[] = [];
   const resolved = new Map<string, any>();
   const segmentPools:Record<string,number>={"Solo professionals":80,"Local businesses":80,"Small online businesses":80,"Growing companies":80};
-  const marketPoolMultiplier=["boom","hype"].includes(game.event_key)?1.22:game.event_key==="recession"?.74:1;
+  const marketPoolMultiplier=1;
   const demandScores=new Map<string,number>();
   for(const team of teams){
     const d=decisions.get(team.id)||{price:team.price,marketing:0,product:0,research:0,operations:0,social:0,borrow:0,specialization:team.specialization,segment:team.segment,risk:"none",partnerCode:""};
     const pivots=Number(d.specialization!==team.specialization)+Number(d.segment!==team.segment);
-    const eventDemand=["boom","hype"].includes(game.event_key)?1.22:game.event_key==="recession"?.74:1;
+    const eventDemand=1;
     const priceFit=clamp((d.specialization==="Sales"?1.42:1.35)-d.price/(d.specialization==="Sales"?300:260),.25,1.25);
     const product=clamp(team.product+d.product/2200-pivots*8,5,100),marketing=clamp(team.marketing*.72+d.marketing/1200+(d.specialization==="Marketing"?10:0),5,100),operations=clamp(team.operations*.8+d.operations/1300+(d.specialization==="Operations"?10:0),5,100);
     const bestFit:Record<string,string>={Sales:"Growing companies",Marketing:"Small online businesses","Customer Support":"Local businesses",Operations:"Solo professionals"};
     const partner=teams.find(candidate=>candidate.join_code===d.partnerCode&&candidate.id!==team.id),partnerDecision=partner?decisions.get(partner.id):null;
     const priceShift=Math.abs(d.price-team.price)/Math.max(1,team.price),pricePenalty=priceShift>=1?.12:priceShift>=.45?.06:0;
-    const privacy=game.event_key==="privacy"?1+(team.social_impact+d.social/800)/160:1,reliability=game.event_key==="outage"?operations/58:1,variation=((team.id.charCodeAt(0)+team.id.charCodeAt(5)+game.quarter*17)%21-10)/100;
+    const privacy=1,reliability=1,variation=((team.id.charCodeAt(0)+team.id.charCodeAt(5)+game.quarter*17)%21-10)/100;
     demandScores.set(team.id,eventDemand*priceFit*(bestFit[d.specialization]===d.segment?1.14:1)*(partnerDecision?.partnerCode===team.join_code?1.12:1)*privacy*reliability*(1+variation)*(.45+marketing/110)*(.7+product/180)*(1-pricePenalty*.5));
   }
   const segmentTotals=new Map<string,number>();
@@ -205,7 +196,6 @@ async function resolveQuarter() {
     if (d.specialization==="Customer Support") retention=clamp(retention+.06,.55,.98);
     const priceShift=Math.abs(d.price-team.price)/Math.max(1,team.price),pricePenalty=priceShift>=1?.12:priceShift>=.45?.06:0;
     retention=clamp(retention-pricePenalty,.45,.98);
-    if (game.event_key === "hype" && product < 50) retention -= .08;
     const customers = Math.max(0, Math.round(team.customers * retention) + acquired);
     const risk = RISKS[d.risk] || RISKS.none;
     const roll = ((team.id.charCodeAt(2) * 13 + game.quarter * 19) % 100) / 100;
