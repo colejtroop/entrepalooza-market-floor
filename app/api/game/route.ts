@@ -217,10 +217,12 @@ async function resolveQuarter() {
     let cash = team.cash+revenue-expense+d.borrow-team.debt*interestRate;
     const reputation = clamp(team.reputation+d.social/2500+riskEffect/8-pivots*2,0,100);
     const socialImpact = clamp(team.social_impact+d.social/900,0,100);
-    if (game.quarter === 1) cash = Math.max(cash,65000);
+    // Q1 stays forgiving through a fixed launch cushion, not a shared valuation floor.
+    // A fixed boost preserves the differences produced by each team's decisions.
+    if (game.quarter === 1) cash += 25000;
     if ([2,3].includes(game.quarter) && cash < 0) { debt += Math.abs(cash)+10000; cash=10000; }
     let valuation = Math.max(0,cash-debt+revenue*4*(1.7+retention)+customers*325+product*2200+reputation*1300);
-    if (game.quarter===1) valuation=Math.max(valuation,team.valuation*.92);
+    if (game.quarter===1) valuation+=50000;
     const status = game.quarter===4 && cash<0 ? "bankrupt" : "active";
     if (status === "bankrupt") valuation=0;
     const lastChange = team.valuation ? (valuation-team.valuation)/team.valuation : 0;
