@@ -33,6 +33,20 @@ async function publicState() {
   const game = await db().prepare("SELECT * FROM game WHERE id=1").first<Record<string, unknown>>();
   const teams = await db().prepare("SELECT id,name,specialization,segment,customers,valuation,last_change,status,submitted,social_impact,risk_score FROM teams ORDER BY valuation DESC").all();
   const announcement = await db().prepare("SELECT text,created_at FROM announcements ORDER BY id DESC LIMIT 1").first();
+  const snapshotRows = (await db().prepare("SELECT quarter,payload FROM snapshots ORDER BY quarter").all()).results as any[];
+  const historyByTeam = new Map<string,{ id:string; name:string; points:{ quarter:number; value:number }[] }>();
+  for (const row of snapshotRows) {
+    for (const team of JSON.parse(String(row.payload)) as any[]) {
+      const series=historyByTeam.get(team.id)||{id:String(team.id),name:String(team.name),points:[] as { quarter:number; value:number }[]};
+      series.points.push({quarter:Math.max(0,Number(row.quarter)-1),value:Number(team.valuation)});
+      historyByTeam.set(team.id,series);
+    }
+  }
+  for (const team of teams.results as any[]) {
+    const series=historyByTeam.get(team.id)||{id:String(team.id),name:String(team.name),points:[] as { quarter:number; value:number }[]};
+    if (Number((game as any)?.quarter)>0 && !series.points.some(point=>point.quarter===Number((game as any).quarter))) series.points.push({quarter:Number((game as any).quarter),value:Number(team.valuation)});
+    historyByTeam.set(team.id,series);
+  }
   const total = (teams.results as any[]).reduce((sum, team) => sum + Number(team.customers || 0), 0) || 1;
   let awards = null;
   if ((game as any)?.status === "finished") {
@@ -40,7 +54,7 @@ async function publicState() {
     const winner = (field: string) => [...awardRows].sort((a,b)=>Number(b[field])-Number(a[field]))[0]?.name || "—";
     awards = { value: winner("valuation"), cash: winner("cash"), impact: winner("social_impact"), risk: winner("risk_score") };
   }
-  return { game, teams: (teams.results as any[]).map((team, i) => ({ ...team, rank: i + 1, marketShare: team.customers / total })), awards, announcement, events: EVENTS, specializations: SPECIALIZATIONS, segments: SEGMENTS, risks: Object.entries(RISKS).map(([key, value]) => ({ key, ...value })) };
+  return { game, teams: (teams.results as any[]).map((team, i) => ({ ...team, rank: i + 1, marketShare: team.customers / total })), history:[...historyByTeam.values()], awards, announcement, events: EVENTS, specializations: SPECIALIZATIONS, segments: SEGMENTS, risks: Object.entries(RISKS).map(([key, value]) => ({ key, ...value })) };
 }
 
 export async function GET(req: NextRequest) {
@@ -87,7 +101,7 @@ export async function POST(req: NextRequest) {
       await db().batch([db().prepare("UPDATE game SET quarter=?,status='active',event_key=?,deadline_at=?,updated_at=? WHERE id=1").bind(quarter,eventKey,Date.now()+minutes*60000,Date.now()), db().prepare("UPDATE teams SET submitted=0 WHERE status='active'")]);
       return NextResponse.json({ ok: true });
     }
-    if (body.action === "lock") { await db().prepare("UPDATE game SET status='locked',updated_at=? WHERE id=1").bind(Date.now()).run(); return NextResponse.json({ ok: true }); }
+    if (body.action === "lock") { const current=await db().prepare("SELECT status FROM game WHERE id=1").first<any>(); const next=current?.status==="locked"?"active":"locked"; await db().prepare("UPDATE game SET status=?,updated_at=? WHERE id=1").bind(next,Date.now()).run(); return NextResponse.json({ ok: true,status:next }); }
     if (body.action === "resolve") { await resolveQuarter(); return NextResponse.json({ ok: true }); }
     if (body.action === "reopen") {
       const minutes = clamp(n(body.minutes, 5), 2, 20);
@@ -164,22 +178,25 @@ async function resolveQuarter() {
     const d = decisions.get(team.id) || { price: team.price, marketing: 0, product: 0, research: 0, operations: 0, social: 0, borrow: 0, specialization: team.specialization, segment: team.segment, risk: "none", takeoverCode: "" };
     const pivots = Number(d.specialization !== team.specialization) + Number(d.segment !== team.segment);
     const eventDemand = ["boom","hype"].includes(game.event_key) ? 1.22 : game.event_key === "recession" ? .74 : 1;
-    const priceFit = clamp(1.35 - d.price / 260, .25, 1.25);
+    const priceFit = clamp((d.specialization==="Sales"?1.42:1.35) - d.price / (d.specialization==="Sales"?300:260), .25, 1.25);
     const product = clamp(team.product + d.product / 2200 - pivots * 8, 5, 100);
-    const marketing = clamp(team.marketing * .72 + d.marketing / 1200, 5, 100);
+    const marketing = clamp(team.marketing * .72 + d.marketing / 1200 + (d.specialization==="Marketing"?10:0), 5, 100);
     const research = clamp(team.research * .78 + d.research / 700, 5, 100);
-    const operations = clamp(team.operations * .8 + d.operations / 1300, 5, 100);
+    const operations = clamp(team.operations * .8 + d.operations / 1300 + (d.specialization==="Operations"?10:0), 5, 100);
     const privacy = game.event_key === "privacy" ? 1 + (team.social_impact + d.social / 800) / 160 : 1;
     const reliability = game.event_key === "outage" ? operations / 58 : 1;
     const bestFit: Record<string,string> = { Sales: "Growing companies", Marketing: "Small online businesses", "Customer Support": "Local businesses", Operations: "Solo professionals" };
     const fit = bestFit[d.specialization] === d.segment ? 1.14 : 1;
+    const directRivals=teams.filter(candidate=>{const rival=decisions.get(candidate.id)||candidate;return candidate.id!==team.id&&rival.specialization===d.specialization&&rival.segment===d.segment}).length;
+    const competition=1/(1+directRivals*.08);
     const partner = teams.find((candidate) => candidate.join_code === d.partnerCode && candidate.id !== team.id);
     const partnerDecision = partner ? decisions.get(partner.id) : null;
     const partnership = partnerDecision?.partnerCode === team.join_code ? 1.12 : 1;
     const variation = ((team.id.charCodeAt(0) + team.id.charCodeAt(5) + game.quarter * 17) % 21 - 10) / 100;
-    const attraction = eventDemand * priceFit * fit * partnership * privacy * reliability * (1 + variation) * (.45 + marketing / 110) * (.7 + product / 180);
+    const attraction = eventDemand * priceFit * fit * competition * partnership * privacy * reliability * (1 + variation) * (.45 + marketing / 110) * (.7 + product / 180);
     const acquired = Math.max(0, Math.round(22 * attraction));
     let retention = clamp(.58 + product / 300 + operations / 500 + team.reputation / 700, .55, .96);
+    if (d.specialization==="Customer Support") retention=clamp(retention+.06,.55,.98);
     if (game.event_key === "hype" && product < 50) retention -= .08;
     const customers = Math.max(0, Math.round(team.customers * retention) + acquired);
     const risk = RISKS[d.risk] || RISKS.none;
