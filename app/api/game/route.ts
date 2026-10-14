@@ -135,7 +135,7 @@ async function submit(body: any) {
   const growth = clamp(n(d.growth), 0, 60000), build = clamp(n(d.build), 0, 60000);
   const payload = {
     price: clamp(n(d.price, team.price), 10, 500), growth, build, marketing: growth*.7, research: growth*.3, product: build*.6, operations: build*.4,
-    social: clamp(n(d.social), 0, 25000), borrow: clamp(n(d.borrow), 0, 50000),
+    social: clamp(n(d.social), 0, 25000), borrow: clamp(n(d.borrow), 0, 100000),
     specialization: SPECIALIZATIONS.includes(d.specialization) ? d.specialization : team.specialization,
     segment: SEGMENTS.includes(d.segment) ? d.segment : team.segment,
     risk: RISKS[d.risk] ? d.risk : "none", partnerCode: String(d.partnerCode || "").toUpperCase(), takeoverCode: String(d.takeoverCode || "").toUpperCase(),
@@ -174,29 +174,36 @@ async function resolveQuarter() {
   const decisions = new Map(rows.map((row) => [row.team_id, JSON.parse(String(row.payload))]));
   const updates: D1PreparedStatement[] = [];
   const resolved = new Map<string, any>();
+  const segmentPools:Record<string,number>={"Solo professionals":80,"Local businesses":80,"Small online businesses":80,"Growing companies":80};
+  const marketPoolMultiplier=["boom","hype"].includes(game.event_key)?1.22:game.event_key==="recession"?.74:1;
+  const demandScores=new Map<string,number>();
+  for(const team of teams){
+    const d=decisions.get(team.id)||{price:team.price,marketing:0,product:0,research:0,operations:0,social:0,borrow:0,specialization:team.specialization,segment:team.segment,risk:"none",partnerCode:""};
+    const pivots=Number(d.specialization!==team.specialization)+Number(d.segment!==team.segment);
+    const eventDemand=["boom","hype"].includes(game.event_key)?1.22:game.event_key==="recession"?.74:1;
+    const priceFit=clamp((d.specialization==="Sales"?1.42:1.35)-d.price/(d.specialization==="Sales"?300:260),.25,1.25);
+    const product=clamp(team.product+d.product/2200-pivots*8,5,100),marketing=clamp(team.marketing*.72+d.marketing/1200+(d.specialization==="Marketing"?10:0),5,100),operations=clamp(team.operations*.8+d.operations/1300+(d.specialization==="Operations"?10:0),5,100);
+    const bestFit:Record<string,string>={Sales:"Growing companies",Marketing:"Small online businesses","Customer Support":"Local businesses",Operations:"Solo professionals"};
+    const partner=teams.find(candidate=>candidate.join_code===d.partnerCode&&candidate.id!==team.id),partnerDecision=partner?decisions.get(partner.id):null;
+    const priceShift=Math.abs(d.price-team.price)/Math.max(1,team.price),pricePenalty=priceShift>=1?.12:priceShift>=.45?.06:0;
+    const privacy=game.event_key==="privacy"?1+(team.social_impact+d.social/800)/160:1,reliability=game.event_key==="outage"?operations/58:1,variation=((team.id.charCodeAt(0)+team.id.charCodeAt(5)+game.quarter*17)%21-10)/100;
+    demandScores.set(team.id,eventDemand*priceFit*(bestFit[d.specialization]===d.segment?1.14:1)*(partnerDecision?.partnerCode===team.join_code?1.12:1)*privacy*reliability*(1+variation)*(.45+marketing/110)*(.7+product/180)*(1-pricePenalty*.5));
+  }
+  const segmentTotals=new Map<string,number>();
+  for(const team of teams){const d=decisions.get(team.id)||team;segmentTotals.set(d.segment,(segmentTotals.get(d.segment)||0)+(demandScores.get(team.id)||0));}
   for (const team of teams) {
     const d = decisions.get(team.id) || { price: team.price, marketing: 0, product: 0, research: 0, operations: 0, social: 0, borrow: 0, specialization: team.specialization, segment: team.segment, risk: "none", takeoverCode: "" };
     const pivots = Number(d.specialization !== team.specialization) + Number(d.segment !== team.segment);
-    const eventDemand = ["boom","hype"].includes(game.event_key) ? 1.22 : game.event_key === "recession" ? .74 : 1;
-    const priceFit = clamp((d.specialization==="Sales"?1.42:1.35) - d.price / (d.specialization==="Sales"?300:260), .25, 1.25);
     const product = clamp(team.product + d.product / 2200 - pivots * 8, 5, 100);
     const marketing = clamp(team.marketing * .72 + d.marketing / 1200 + (d.specialization==="Marketing"?10:0), 5, 100);
     const research = clamp(team.research * .78 + d.research / 700, 5, 100);
     const operations = clamp(team.operations * .8 + d.operations / 1300 + (d.specialization==="Operations"?10:0), 5, 100);
-    const privacy = game.event_key === "privacy" ? 1 + (team.social_impact + d.social / 800) / 160 : 1;
-    const reliability = game.event_key === "outage" ? operations / 58 : 1;
-    const bestFit: Record<string,string> = { Sales: "Growing companies", Marketing: "Small online businesses", "Customer Support": "Local businesses", Operations: "Solo professionals" };
-    const fit = bestFit[d.specialization] === d.segment ? 1.14 : 1;
-    const directRivals=teams.filter(candidate=>{const rival=decisions.get(candidate.id)||candidate;return candidate.id!==team.id&&rival.specialization===d.specialization&&rival.segment===d.segment}).length;
-    const competition=1/(1+directRivals*.08);
-    const partner = teams.find((candidate) => candidate.join_code === d.partnerCode && candidate.id !== team.id);
-    const partnerDecision = partner ? decisions.get(partner.id) : null;
-    const partnership = partnerDecision?.partnerCode === team.join_code ? 1.12 : 1;
-    const variation = ((team.id.charCodeAt(0) + team.id.charCodeAt(5) + game.quarter * 17) % 21 - 10) / 100;
-    const attraction = eventDemand * priceFit * fit * competition * partnership * privacy * reliability * (1 + variation) * (.45 + marketing / 110) * (.7 + product / 180);
-    const acquired = Math.max(0, Math.round(22 * attraction));
+    const attraction=demandScores.get(team.id)||0,totalDemand=segmentTotals.get(d.segment)||1;
+    const acquired=Math.max(0,Math.round((segmentPools[d.segment]||80)*marketPoolMultiplier*attraction/totalDemand));
     let retention = clamp(.58 + product / 300 + operations / 500 + team.reputation / 700, .55, .96);
     if (d.specialization==="Customer Support") retention=clamp(retention+.06,.55,.98);
+    const priceShift=Math.abs(d.price-team.price)/Math.max(1,team.price),pricePenalty=priceShift>=1?.12:priceShift>=.45?.06:0;
+    retention=clamp(retention-pricePenalty,.45,.98);
     if (game.event_key === "hype" && product < 50) retention -= .08;
     const customers = Math.max(0, Math.round(team.customers * retention) + acquired);
     const risk = RISKS[d.risk] || RISKS.none;
@@ -204,8 +211,9 @@ async function resolveQuarter() {
     const riskEffect = roll < risk.chance ? risk.up : risk.down;
     const revenue = customers * d.price * 3 * (1 + riskEffect / 100);
     const expense = d.marketing+d.product+d.research+d.operations+d.social+pivots*15000;
-    let debt = team.debt*1.03+d.borrow;
-    let cash = team.cash+revenue-expense+d.borrow-team.debt*.03;
+    const interestRate=team.valuation>=750000?.02:team.valuation>=500000?.03:team.valuation>=250000?.05:.07;
+    let debt = team.debt+d.borrow;
+    let cash = team.cash+revenue-expense+d.borrow-team.debt*interestRate;
     const reputation = clamp(team.reputation+d.social/2500+riskEffect/8-pivots*2,0,100);
     const socialImpact = clamp(team.social_impact+d.social/900,0,100);
     if (game.quarter === 1) cash = Math.max(cash,65000);
