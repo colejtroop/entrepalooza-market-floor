@@ -13,9 +13,9 @@ const SPECIALIZATIONS = ["Sales", "Marketing", "Customer Support", "Operations"]
 const SEGMENTS = ["Solo professionals", "Local businesses", "Small online businesses", "Growing companies"];
 const RISKS: Record<string, { label: string; chance: number; up: number; down: number }> = {
   none: { label: "No major risk", chance: 1, up: 0, down: 0 },
-  expansion: { label: "Aggressive expansion", chance: .55, up: 26, down: -18 },
-  launch: { label: "Experimental launch", chance: .48, up: 32, down: -15 },
-  campaign: { label: "Major ad campaign", chance: .62, up: 22, down: -20 },
+  expansion: { label: "Measured expansion", chance: .75, up: 14, down: -6 },
+  launch: { label: "Bold product launch", chance: .50, up: 28, down: -14 },
+  campaign: { label: "Moonshot campaign", chance: .25, up: 52, down: -28 },
 };
 
 function db() { if (!env.DB) throw new Error("Database is not configured"); return env.DB; }
@@ -44,7 +44,7 @@ async function publicState() {
   }
   for (const team of teams.results as any[]) {
     const series=historyByTeam.get(team.id)||{id:String(team.id),name:String(team.name),points:[] as { quarter:number; value:number }[]};
-    if (Number((game as any)?.quarter)>0 && !series.points.some(point=>point.quarter===Number((game as any).quarter))) series.points.push({quarter:Number((game as any).quarter),value:Number(team.valuation)});
+    if (["results","finished"].includes(String((game as any)?.status)) && Number((game as any)?.quarter)>0 && !series.points.some(point=>point.quarter===Number((game as any).quarter))) series.points.push({quarter:Number((game as any).quarter),value:Number(team.valuation)});
     historyByTeam.set(team.id,series);
   }
   const total = (teams.results as any[]).reduce((sum, team) => sum + Number(team.customers || 0), 0) || 1;
@@ -141,7 +141,7 @@ async function submit(body: any) {
     risk: RISKS[d.risk] ? d.risk : "none", partnerCode: String(d.partnerCode || "").toUpperCase(), takeoverCode: String(d.takeoverCode || "").toUpperCase(),
   };
   const pivots = Number(payload.specialization !== team.specialization) + Number(payload.segment !== team.segment);
-  const cost = payload.growth+payload.build+payload.social+pivots*15000;
+  const cost = payload.growth+payload.build+payload.social+pivots*10000;
   if (cost > team.cash + payload.borrow) return NextResponse.json({ error: "Planned spending exceeds available cash." }, { status: 400 });
   if (payload.takeoverCode && game.quarter !== 4) return NextResponse.json({ error: "Hostile takeovers unlock in Q4." }, { status: 400 });
   await db().prepare("INSERT INTO submissions (team_id,quarter,payload,created_at) VALUES (?,?,?,?) ON CONFLICT(team_id,quarter) DO UPDATE SET payload=excluded.payload,created_at=excluded.created_at").bind(team.id, game.quarter, JSON.stringify(payload), Date.now()).run();
@@ -199,7 +199,8 @@ async function resolveQuarter() {
     const research = clamp(team.research * .78 + d.research / 700, 5, 100);
     const operations = clamp(team.operations * .8 + d.operations / 1300 + (d.specialization==="Operations"?10:0), 5, 100);
     const attraction=demandScores.get(team.id)||0,totalDemand=segmentTotals.get(d.segment)||1;
-    const acquired=Math.max(0,Math.round((segmentPools[d.segment]||80)*marketPoolMultiplier*attraction/totalDemand));
+    const segmentNoise=.88+((d.segment.charCodeAt(0)*7+d.segment.charCodeAt(d.segment.length-1)*3+game.quarter*11)%25)/100;
+    const acquired=Math.max(0,Math.round((segmentPools[d.segment]||80)*marketPoolMultiplier*segmentNoise*attraction/totalDemand));
     let retention = clamp(.58 + product / 300 + operations / 500 + team.reputation / 700, .55, .96);
     if (d.specialization==="Customer Support") retention=clamp(retention+.06,.55,.98);
     const priceShift=Math.abs(d.price-team.price)/Math.max(1,team.price),pricePenalty=priceShift>=1?.12:priceShift>=.45?.06:0;
@@ -210,7 +211,7 @@ async function resolveQuarter() {
     const roll = ((team.id.charCodeAt(2) * 13 + game.quarter * 19) % 100) / 100;
     const riskEffect = roll < risk.chance ? risk.up : risk.down;
     const revenue = customers * d.price * 3 * (1 + riskEffect / 100);
-    const expense = d.marketing+d.product+d.research+d.operations+d.social+pivots*15000;
+    const expense = d.marketing+d.product+d.research+d.operations+d.social+pivots*10000;
     const interestRate=team.valuation>=750000?.02:team.valuation>=500000?.03:team.valuation>=250000?.05:.07;
     let debt = team.debt+d.borrow;
     let cash = team.cash+revenue-expense+d.borrow-team.debt*interestRate;
@@ -232,9 +233,9 @@ async function resolveQuarter() {
       if (!attacker.takeoverCode || attacker.status!=="active") continue;
       const target=[...resolved.values()].find((item)=>item.join_code===attacker.takeoverCode&&item.id!==attacker.id&&item.status==="active");
       if (!target) continue;
-      const cost=target.valuation*.65;
-      if (attacker.valuation>=target.valuation*2&&attacker.cash>=cost) {
-        updates.push(db().prepare("UPDATE teams SET cash=cash-?,customers=customers+?,valuation=valuation+?,last_change=last_change+0.08 WHERE id=?").bind(cost,Math.round(target.customers*.45),target.valuation*.35,attacker.id));
+      const cashDown=target.valuation*.20,financed=target.valuation*.35;
+      if (attacker.valuation>=target.valuation*1.6&&attacker.cash>=cashDown) {
+        updates.push(db().prepare("UPDATE teams SET cash=cash-?,debt=debt+?,customers=customers+?,valuation=valuation+?,last_change=last_change+0.08 WHERE id=?").bind(cashDown,financed,Math.round(target.customers*.45),target.valuation*.15,attacker.id));
         updates.push(db().prepare("UPDATE teams SET status='acquired',valuation=0,last_change=-1 WHERE id=?").bind(target.id));
       }
     }
