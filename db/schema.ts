@@ -5,6 +5,7 @@ export const game = sqliteTable("game", {
   quarter: integer("quarter").notNull().default(0),
   status: text("status").notNull().default("lobby"),
   eventKey: text("event_key").notNull().default("steady"),
+  deadlineAt: integer("deadline_at").notNull().default(0),
   updatedAt: integer("updated_at").notNull().default(0),
 });
 
@@ -26,4 +27,11 @@ export const submissions = sqliteTable("submissions", {
 
 export const announcements = sqliteTable("announcements", {
   id: integer("id").primaryKey({ autoIncrement: true }), text: text("text").notNull(), createdAt: integer("created_at").notNull(),
+});
+
+export const snapshots = sqliteTable("snapshots", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  quarter: integer("quarter").notNull().unique(),
+  payload: text("payload").notNull(),
+  createdAt: integer("created_at").notNull(),
 });

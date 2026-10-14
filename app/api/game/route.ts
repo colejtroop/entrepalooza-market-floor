@@ -26,7 +26,7 @@ function adminOk(req: NextRequest) {
   const secret = (env as unknown as { ADMIN_CODE?: string }).ADMIN_CODE || process.env.ADMIN_CODE;
   return !!secret && req.headers.get("x-admin-code") === secret;
 }
-async function ensureGame() { await db().prepare("INSERT OR IGNORE INTO game (id,quarter,status,event_key,updated_at) VALUES (1,0,'lobby','steady',?)").bind(Date.now()).run(); }
+async function ensureGame() { await db().prepare("INSERT OR IGNORE INTO game (id,quarter,status,event_key,deadline_at,updated_at) VALUES (1,0,'lobby','steady',0,?)").bind(Date.now()).run(); }
 
 async function publicState() {
   await ensureGame();
@@ -83,11 +83,28 @@ export async function POST(req: NextRequest) {
       const current = await db().prepare("SELECT quarter FROM game WHERE id=1").first<any>();
       const quarter = Math.min(4, Math.max(1, n(body.quarter, current?.quarter + 1)));
       const eventKey = EVENTS.some((event) => event.key === body.eventKey) ? body.eventKey : "steady";
-      await db().batch([db().prepare("UPDATE game SET quarter=?,status='active',event_key=?,updated_at=? WHERE id=1").bind(quarter,eventKey,Date.now()), db().prepare("UPDATE teams SET submitted=0 WHERE status='active'")]);
+      const minutes = clamp(n(body.minutes, 12), 5, 20);
+      await db().batch([db().prepare("UPDATE game SET quarter=?,status='active',event_key=?,deadline_at=?,updated_at=? WHERE id=1").bind(quarter,eventKey,Date.now()+minutes*60000,Date.now()), db().prepare("UPDATE teams SET submitted=0 WHERE status='active'")]);
       return NextResponse.json({ ok: true });
     }
     if (body.action === "lock") { await db().prepare("UPDATE game SET status='locked',updated_at=? WHERE id=1").bind(Date.now()).run(); return NextResponse.json({ ok: true }); }
     if (body.action === "resolve") { await resolveQuarter(); return NextResponse.json({ ok: true }); }
+    if (body.action === "reopen") {
+      const minutes = clamp(n(body.minutes, 5), 2, 20);
+      await db().prepare("UPDATE game SET status='active',deadline_at=?,updated_at=? WHERE id=1").bind(Date.now()+minutes*60000,Date.now()).run();
+      return NextResponse.json({ ok: true });
+    }
+    if (body.action === "restartQuarter") { await restartQuarter(clamp(n(body.minutes,12),5,20)); return NextResponse.json({ ok: true }); }
+    if (body.action === "deleteTeam") {
+      const teamId=String(body.teamId||"");
+      await db().batch([db().prepare("DELETE FROM submissions WHERE team_id=?").bind(teamId),db().prepare("DELETE FROM teams WHERE id=?").bind(teamId)]);
+      return NextResponse.json({ ok: true });
+    }
+    if (body.action === "resetEvent") {
+      if (body.confirm !== "RESET") return NextResponse.json({ error: "Type RESET to confirm." }, { status: 400 });
+      await db().batch([db().prepare("DELETE FROM submissions"),db().prepare("DELETE FROM snapshots"),db().prepare("DELETE FROM announcements"),db().prepare("DELETE FROM teams"),db().prepare("UPDATE game SET quarter=0,status='lobby',event_key='steady',deadline_at=0,updated_at=? WHERE id=1").bind(Date.now())]);
+      return NextResponse.json({ ok: true });
+    }
     return NextResponse.json({ error: "Unknown action." }, { status: 400 });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Request failed";
@@ -101,18 +118,16 @@ async function submit(body: any) {
   if (!team) return NextResponse.json({ error: "Company access denied." }, { status: 403 });
   if (game.status !== "active") return NextResponse.json({ error: "Decisions are not open." }, { status: 409 });
   const d = body.decision || {};
+  const growth = clamp(n(d.growth), 0, 60000), build = clamp(n(d.build), 0, 60000);
   const payload = {
-    price: clamp(n(d.price, team.price), 10, 500), marketing: clamp(n(d.marketing), 0, 60000), product: clamp(n(d.product), 0, 60000),
-    research: clamp(n(d.research), 0, 30000), operations: clamp(n(d.operations), 0, 50000), social: clamp(n(d.social), 0, 25000), borrow: clamp(n(d.borrow), 0, 50000),
+    price: clamp(n(d.price, team.price), 10, 500), growth, build, marketing: growth*.7, research: growth*.3, product: build*.6, operations: build*.4,
+    social: clamp(n(d.social), 0, 25000), borrow: clamp(n(d.borrow), 0, 50000),
     specialization: SPECIALIZATIONS.includes(d.specialization) ? d.specialization : team.specialization,
     segment: SEGMENTS.includes(d.segment) ? d.segment : team.segment,
     risk: RISKS[d.risk] ? d.risk : "none", partnerCode: String(d.partnerCode || "").toUpperCase(), takeoverCode: String(d.takeoverCode || "").toUpperCase(),
   };
   const pivots = Number(payload.specialization !== team.specialization) + Number(payload.segment !== team.segment);
-  const spendActions = [payload.marketing,payload.product,payload.research,payload.operations,payload.social].filter((value) => value > 0).length;
-  const specialActions = pivots * 2 + Number(payload.borrow > 0) + Number(payload.risk !== "none") + Number(!!payload.partnerCode) + Number(!!payload.takeoverCode);
-  if (spendActions + specialActions > 5) return NextResponse.json({ error: "This plan uses more than five action slots." }, { status: 400 });
-  const cost = payload.marketing+payload.product+payload.research+payload.operations+payload.social+pivots*15000;
+  const cost = payload.growth+payload.build+payload.social+pivots*15000;
   if (cost > team.cash + payload.borrow) return NextResponse.json({ error: "Planned spending exceeds available cash." }, { status: 400 });
   if (payload.takeoverCode && game.quarter !== 4) return NextResponse.json({ error: "Hostile takeovers unlock in Q4." }, { status: 400 });
   await db().prepare("INSERT INTO submissions (team_id,quarter,payload,created_at) VALUES (?,?,?,?) ON CONFLICT(team_id,quarter) DO UPDATE SET payload=excluded.payload,created_at=excluded.created_at").bind(team.id, game.quarter, JSON.stringify(payload), Date.now()).run();
@@ -120,10 +135,27 @@ async function submit(body: any) {
   return NextResponse.json({ ok: true });
 }
 
+async function restartQuarter(minutes: number) {
+  const game = await db().prepare("SELECT quarter FROM game WHERE id=1").first<any>();
+  const snapshot = await db().prepare("SELECT payload FROM snapshots WHERE quarter=?").bind(game?.quarter||0).first<any>();
+  if (snapshot) {
+    const teams = JSON.parse(String(snapshot.payload)) as any[];
+    const statements:D1PreparedStatement[]=[db().prepare("DELETE FROM teams")];
+    for(const t of teams) statements.push(db().prepare("INSERT INTO teams (id,name,join_code,specialization,segment,price,cash,debt,customers,revenue,valuation,marketing,product,research,operations,reputation,social_impact,risk_score,status,submitted,last_change,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(t.id,t.name,t.join_code,t.specialization,t.segment,t.price,t.cash,t.debt,t.customers,t.revenue,t.valuation,t.marketing,t.product,t.research,t.operations,t.reputation,t.social_impact,t.risk_score,t.status,0,t.last_change,t.created_at));
+    statements.push(db().prepare("DELETE FROM submissions WHERE quarter=?").bind(game.quarter));
+    await db().batch(statements);
+  } else {
+    await db().batch([db().prepare("DELETE FROM submissions WHERE quarter=?").bind(game?.quarter||0),db().prepare("UPDATE teams SET submitted=0 WHERE status='active'")]);
+  }
+  await db().prepare("UPDATE game SET status='active',deadline_at=?,updated_at=? WHERE id=1").bind(Date.now()+minutes*60000,Date.now()).run();
+}
+
 async function resolveQuarter() {
   const game = await db().prepare("SELECT * FROM game WHERE id=1").first<any>();
   if (!game || !["active", "locked"].includes(game.status)) throw new Error("No open quarter to resolve.");
   const teams = (await db().prepare("SELECT * FROM teams WHERE status='active'").all()).results as any[];
+  const allTeams = (await db().prepare("SELECT * FROM teams").all()).results as any[];
+  await db().prepare("INSERT INTO snapshots (quarter,payload,created_at) VALUES (?,?,?) ON CONFLICT(quarter) DO UPDATE SET payload=excluded.payload,created_at=excluded.created_at").bind(game.quarter,JSON.stringify(allTeams),Date.now()).run();
   const rows = (await db().prepare("SELECT team_id,payload FROM submissions WHERE quarter=?").bind(game.quarter).all()).results as any[];
   const decisions = new Map(rows.map((row) => [row.team_id, JSON.parse(String(row.payload))]));
   const updates: D1PreparedStatement[] = [];
